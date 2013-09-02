@@ -1,11 +1,13 @@
 package Test::Context;
 
-use 5.010;
+use 5.008;
 use strict;
 use warnings;
-use fields qw(save_mode save_path digest_class _effective_context _context_checked _checkpoint);
+
+use fields qw(save_mode test_mode save_path digest_class _effective_context _context_checked _checkpoint);
 use Test::More;
 use IO::File;
+use Sereal::Encoder qw(encode_sereal);
 use Data::Dumper;
 
 our $VERSION = '0.01';
@@ -15,7 +17,6 @@ sub new {
 	my $self = {};
 	bless $self,$class;
 	my %par = @_;
-	#printf "new called, par=%s\n", Dumper(\%par);
 	$self->{$_} = $par{$_} for keys %par;
 	$self->{digest_class} = 'Digest::MD5' unless $self->{digest_class};
 	my $dc = $self->{digest_class};
@@ -23,32 +24,32 @@ sub new {
 	my @dc_methods = qw(add hexdigest addfile);
 	my  @inv_methods = grep(!$dc->can($_),@dc_methods);
 	die "Invalid digest class $dc, methods are not supported: ".join ", ",@inv_methods if @inv_methods;
+	return $self if $self->idle;
 	$self->load_checkpoints unless $self->{save_mode};
-	#printf "new called, save_mode=%s\n", $self->{save_mode};
 	return $self;        
 }
 
 sub idle {
 	my $self = shift;
-	return !defined($self);
+	return !($self->{test_mode} || $self->{save_mode});
 }
 
 # continue calculating effective digest for specified context
 sub add_context {
 	my ($self,$name,$value) = @_;
-	#$DB::single = 2;
 	return if $self->idle;
 	die "can't use this context, it has already been checked:$name" if exists $self->{_context_checked}{$name};
 	my $context = $self->{_effective_context}{$name};
 	$context = $self->{_effective_context}{$name} = $self->{digest_class}->new unless defined($context);
+	$value = encode_sereal($value,{sort_keys=>1}) if ref($value);
 	$context->add($value);
-	#printf "added context:%s\n",Dumper($self->{_effective_context});
 }
 
 # check if accumulated (effective) and pattern(source) digest for specified context are equal
 sub check_context {
-	my ($self,$name) = @_;
+	my ($self,$name,$value) = @_;
 	return if $self->idle;
+	$self->add_context($name,$value) if defined($value);
 	$self->{_context_checked}{$name} = undef; # touch checked flag
 	return if $self->{save_mode};
 	my $s_digest = $self->{_checkpoint}{$name};
@@ -99,23 +100,16 @@ sub load_checkpoints {
 
 sub save_checkpoints {
 	my $self = shift;
+	return unless $self->{save_mode};
 	my $file = $self->{save_path};
 	my $fh = IO::File->new( $file, "w" );
-	die "can't create file $file with checkpoints" unless defined $fh;
+	die "can't create file $file with checkpoints: $!" unless defined $fh;
 	my @keys = keys %{$self->{_effective_context}};
-	#print "save_checkpoints:keys = ".join(", ", @keys)."\n";
 	for my $name (@keys) {
 		die "context was not checked:$name" unless exists $self->{_context_checked}{$name};
 		printf $fh "%s\t%s\n",$name,$self->{_effective_context}{$name}->hexdigest;
 	}
 	close($fh);
-}
-
-sub DESTROY {
-	my $self = shift;
-	#printf "DESTROY called, self=%s\n", Dumper($self);
-	#printf "DESTROY called, save_mode=%s\n", $self->{save_mode};
-	$self->save_checkpoints if $self->{save_mode};
 }
 
 1;
@@ -127,21 +121,25 @@ Test::Context - Save context before refactoring and use it for regression tests
 
 =head1 SYNOPSIS
 
-  use Test::Context;
-  my $regression = grep m{^--regression_(save|test)$}, @ARGV;
-  my $tc;
-  if ($regression) {
-	$tc = Test::Context->new({
-	save_mode=>scalar(grep $_ eq --regression_save,@ARGV),
-	save_path=>"/tmp/script-to-refactor"
-	});
+	use Test::Context;
+	my $regression = grep m{^--regression_(save|test)$}, @ARGV;
+	my $tc;
+	GetOptions (
+			"regression_save" => \$regression_save,
+			"regression_test" => \$regression_test,
+			...
+	) || die "$usage\n";
+	$tc = Test::Context->new(Test::Context->new(
+		save_mode=>$regression_save,
+		test_mode=>$regression_test,
+		save_path=>"/tmp/script-to-refactor"
+	);
   }
-  $tc->add_context("var1" => "some content");
   $tc->check_file("/tmp/input"); # when run with --save_context option will store digest of input_file. 
 								# with --test_context will check if file exists and digest is the same when it was saved
-  $tc->check_context("var1"); # this will check if context "var1" has the very saved digest
+  $tc->check_context("var1",$var1); # this will check if context "var1" has the very saved digest
   $tc->skip_context("/tmp/input") unless -f "/tmp/input"; # we can proceed without input by saying hello to world
-  
+  $tc->save_checkpoints; # call it before exit so --regression_test can use calculated value
 
 =head1 DESCRIPTION
 
